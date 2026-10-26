@@ -50,7 +50,7 @@
 
   <Package
     Name="$(Identity)"
-    Manufacturer="Carmine Paolino"
+    Manufacturer="eclipcses (Soloist fork)"
     Version="$(Version)"
     UpgradeCode="$(UpgradeCode)"
     Scope="perUser"

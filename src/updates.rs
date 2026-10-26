@@ -20,13 +20,13 @@ pub const CONFIG: UpdateConfig = UpdateConfig {
     },
     // Releases publish an Ed25519 signature for checksums.txt. Require it
     // before downloading an update, using the release workflow's public key.
-    publisher_key: Some(include_str!("../assets/update-public-key.hex")),
+    publisher_key: Some(include_str!("../assets/soloist-update-public-key.hex")),
     // Releases build their AppImages before publishing, so the signed
     // checksums.txt lists them (#737): an AppImage replaces itself with the
     // next one.
     appimage: true,
     ..UpdateConfig::new(
-        "crmne/spotifast",
+        "eclipcses/spotifast-soloist",
         "Spotifast",
         "spotifast",
         env!("CARGO_PKG_VERSION"),
@@ -56,6 +56,15 @@ mod tests {
             "updates must require a publisher signature"
         );
         CONFIG.validate().unwrap();
+    }
+
+    #[test]
+    fn soloist_updates_stay_on_the_fork_and_require_its_own_key() {
+        assert_eq!(CONFIG.repository, "eclipcses/spotifast-soloist");
+        assert_ne!(
+            CONFIG.publisher_key.unwrap().trim(),
+            include_str!("../assets/update-public-key.hex").trim()
+        );
     }
 
     /// An AppImage may replace itself only because the release workflow

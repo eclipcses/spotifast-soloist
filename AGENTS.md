@@ -1,5 +1,20 @@
 # Spotifast agent guide
 
+## This fork
+
+This repository is `eclipcses/spotifast-soloist`, a personal Windows x86_64
+fork. The owner has approved official Soloist playback, its setup interface,
+and signed releases from this fork. These fork-specific choices take
+precedence over upstream's product restrictions below. Never bundle Soloist
+or commit API keys, pairing data, private signing keys, or local profiles.
+The updater must use this fork and `assets/soloist-update-public-key.hex`.
+Keep upstream dependency sources unchanged unless a separate fix requires it.
+Future upstream synchronizations may use merge commits to preserve published
+fork history. Do not force-push main. Check Windows without MilkDrop, then
+publish a higher fork version through `.github/workflows/soloist-windows.yml`.
+Upstream workflow files remain for reference and merging; only this fork's
+Windows workflow should be enabled here.
+
 Follow `CONTRIBUTING.md`; it is the canonical product and contribution policy.
 These instructions add implementation constraints for coding agents.
 

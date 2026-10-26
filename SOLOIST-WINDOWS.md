@@ -31,13 +31,16 @@ Soloist processes. Setup errors appear in the app.
 
 ## Limits
 
-- This is a personal experimental change, not an upstream Spotifast release.
-  Installing an upstream Spotifast update will replace this integration.
+- This is a personal fork, not an upstream Spotifast release. Builds from
+  0.14.3 onward check this fork's signed releases for updates. Installing an
+  original-project installer manually will replace the integration.
 - Soloist plays the audio; Spotifast's equalizer, audio visualizers,
   local-file playback, audio-output selection and librespot audio settings
   do not affect it. Choose the Windows default audio output instead.
   Soloist also does not inherit Spotifast's proxy configuration.
 - Spotifast's Web API still supplies library, search and playback controls.
+  From upstream 0.14.2, this requires your own Spotify app's Client ID, which
+  the sign-in screen helps you create. It is separate from the Soloist key.
   Its existing account, permission, Premium and rate-limit requirements apply.
   Session-only library features may be unavailable because the librespot
   playback session is stopped while Soloist is selected.

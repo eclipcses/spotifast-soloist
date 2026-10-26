@@ -36,12 +36,12 @@
 AppId={{FCED1EA0-EBF5-4C32-BA3B-A3AD724BACC3}
 AppName={#AppName}
 AppVersion={#Version}
-AppVerName={#AppName} {#Version}
-AppPublisher=Carmine Paolino
+AppVerName={#AppName} Soloist {#Version}
+AppPublisher=eclipcses (Soloist fork)
 AppCopyright=© 2026 Carmine Paolino
-AppPublisherURL=https://spotifast.rocks
-AppSupportURL=https://github.com/crmne/spotifast/issues
-AppUpdatesURL=https://spotifast.rocks/download/
+AppPublisherURL=https://github.com/eclipcses/spotifast-soloist
+AppSupportURL=https://github.com/eclipcses/spotifast-soloist
+AppUpdatesURL=https://github.com/eclipcses/spotifast-soloist/releases/latest
 DefaultDirName={localappdata}\Programs\{#AppName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes

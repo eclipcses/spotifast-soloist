@@ -1,3 +1,23 @@
+# Spotifast Soloist for Windows
+
+Personal fork of [crmne/spotifast](https://github.com/crmne/spotifast), based
+on upstream 0.14.2 with official Soloist playback for newer Spotify accounts.
+
+- [Download this fork's Windows releases](https://github.com/eclipcses/spotifast-soloist/releases/latest).
+- [Set up Soloist](SOLOIST-WINDOWS.md). Spotify's executable and your API key
+  are supplied separately; Soloist is never bundled here.
+- Updates are checked against **this fork**, verified with its own publisher
+  key, and preserve the Soloist integration. Upstream updates must first be
+  merged, tested, and released here.
+- Windows x86_64 is the supported release target. MilkDrop is omitted.
+- Upstream 0.14.2 requires your own Spotify app's Client ID for library,
+  search, and playback control. This is separate from your Soloist API key;
+  the sign-in screen guides you through setup.
+- [Maintaining and releasing the fork](FORK-MAINTENANCE.md).
+
+The upstream README follows. Its original-project download links refer to
+official Spotifast, which does not include this fork's Soloist integration.
+
 <p align="center">
   <img src="docs/assets/images/logo.svg" alt="Spotifast logo" width="88" height="88">
 </p>
