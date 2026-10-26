@@ -9,8 +9,8 @@ use crate::theme::{self, Icon};
 
 use super::widgets;
 
-const LINE_SIZE: f32 = 19.0;
-const LINE_GAP: f32 = 10.0;
+const LINE_SIZE: f32 = 24.0;
+const LINE_GAP: f32 = 16.0;
 /// Where the line being sung sits, as a fraction of the visible lyrics from
 /// the top: high up, so the lines to come fill most of the view.
 const SUNG_LINE_AT: f32 = 0.2;
@@ -31,6 +31,60 @@ const LIGHT_UP_SECONDS: f32 = 0.22;
 fn blend(from: egui::Color32, to: egui::Color32, t: f32) -> egui::Color32 {
     let t = t.clamp(0.0, 1.0);
     egui::Color32::from(egui::Rgba::from(from) * (1.0 - t) + egui::Rgba::from(to) * t)
+}
+
+/// A decorative sweep estimated from line timestamps, not word alignment.
+/// Keep the final line steady: its end is unknown, and instrumental tails
+/// would otherwise make the words crawl for the rest of the recording.
+fn line_progress(lyrics: &crate::lyrics::Lyrics, index: usize, position: u32) -> Option<f32> {
+    let start = lyrics.lines.get(index)?.at_ms?;
+    let end = lyrics.lines.get(index + 1)?.at_ms?;
+    let duration = end.checked_sub(start).filter(|duration| *duration > 0)?;
+    Some((position.saturating_sub(start) as f32 / duration as f32).clamp(0.0, 1.0))
+}
+
+/// Paint the same shaped text twice, clipping the bright layer row by row.
+/// Layout never changes during the sweep, including wrapped and RTL text.
+fn lyric_label(
+    ui: &mut egui::Ui,
+    text: &str,
+    size: f32,
+    color: Color32,
+    sense: Sense,
+    sweep: Option<f32>,
+) -> egui::Response {
+    let galley = crate::bidi::layout(
+        ui.painter(),
+        text,
+        theme::bold(size),
+        color,
+        ui.available_width(),
+        usize::MAX,
+        None,
+    );
+    let response = ui.add(egui::Label::new(galley.clone()).sense(sense));
+    if let Some(progress) = sweep {
+        let origin = crate::bidi::galley_pos(response.rect, &galley);
+        let total: f32 = galley.rows.iter().map(|row| row.rect().width()).sum();
+        let mut remaining = total * progress;
+        for row in &galley.rows {
+            let mut clip = row.rect().translate(origin.to_vec2());
+            let width = remaining.clamp(0.0, clip.width());
+            remaining -= clip.width();
+            if width <= 0.0 {
+                continue;
+            }
+            if crate::bidi::is_rtl(text) {
+                clip.min.x = clip.max.x - width;
+            } else {
+                clip.max.x = clip.min.x + width;
+            }
+            ui.painter()
+                .with_clip_rect(ui.clip_rect().intersect(clip))
+                .galley_with_override_text_color(origin, galley.clone(), ui.visuals().text_color());
+        }
+    }
+    response
 }
 
 pub fn side_panel(app: &mut App, ui: &mut egui::Ui) {
@@ -204,10 +258,18 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
     };
 
     let active = lyrics.active_line(now.position_ms);
+    if now.playing
+        && !crate::motion::reduced(ui.ctx())
+        && active
+            .and_then(|index| line_progress(&lyrics, index, now.position_ms))
+            .is_some()
+    {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(33));
+    }
+
     let follow = app.lyrics_following && app.lyrics_line_shown != Some(active);
-    // The line being sung is bold and in the accent colour; every other
-    // line is quiet, regular text, the same before and after it has been
-    // sung. A line takes 220 ms to light up or fade, as in omarchy-lyrics.
+    // Fixed bold metrics keep wrapping stable as lines brighten.
     let quiet = palette.text.gamma_multiply(0.45);
     let scroll = crate::autoscroll::show(
         ui,
@@ -229,15 +291,21 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
             for (index, line) in lyrics.lines.iter().enumerate() {
                 let is_active = active == Some(index);
                 let lit = ui.ctx().animate_bool_with_time(
-                    egui::Id::new("lyric-line").with(index),
+                    egui::Id::new("lyric-line").with((&now.uri, index)),
                     is_active,
                     crate::motion::seconds(ui.ctx(), LIGHT_UP_SECONDS),
                 );
-                let color = blend(quiet, palette.accent, lit);
-                let font = if lit > 0.5 {
-                    theme::bold(LINE_SIZE)
+                let sweep = (is_active && !crate::motion::reduced(ui.ctx()))
+                    .then(|| line_progress(&lyrics, index, now.position_ms))
+                    .flatten();
+                let color = if lyrics.synced {
+                    blend(
+                        quiet,
+                        palette.text,
+                        lit * if sweep.is_some() { 0.35 } else { 1.0 },
+                    )
                 } else {
-                    theme::regular(LINE_SIZE)
+                    palette.text
                 };
                 // A timed line with no words is the band playing on.
                 let text = if line.text.is_empty() && lyrics.synced {
@@ -250,23 +318,7 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                 } else {
                     Sense::hover()
                 };
-                let response = if crate::bidi::is_rtl(text) {
-                    let galley = crate::bidi::layout(
-                        ui.painter(),
-                        text,
-                        font,
-                        color,
-                        ui.available_width(),
-                        usize::MAX,
-                        None,
-                    );
-                    ui.add(egui::Label::new(galley).sense(sense))
-                } else {
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(text).font(font).color(color))
-                            .sense(sense),
-                    )
-                };
+                let response = lyric_label(ui, text, LINE_SIZE, color, sense, sweep);
                 crate::autoscroll::row(ui, &response);
                 let rect = response.rect;
                 if lyrics.synced
@@ -724,6 +776,16 @@ fn fullscreen_contents(app: &mut App, ui: &mut egui::Ui) {
     };
 
     let active = lyrics.active_line(now.position_ms);
+    if now.playing
+        && !crate::motion::reduced(ui.ctx())
+        && active
+            .and_then(|index| line_progress(&lyrics, index, now.position_ms))
+            .is_some()
+    {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(33));
+    }
+
     // A Follow click resets the remembered line after drawing. Other frames
     // record the shown line before any line-click action restores following.
     if !app
@@ -742,11 +804,11 @@ fn fullscreen_contents(app: &mut App, ui: &mut egui::Ui) {
     let following = app.lyrics_following && !manual_scroll;
     let follow = following && app.lyrics_line_shown != Some(active);
     let animation = crate::motion::scroll(ui.ctx(), 0.45);
-    let size = (ui.available_width() * 0.046).clamp(28.0, 42.0);
+    let size = (ui.available_width() * 0.065).clamp(30.0, 46.0);
     // The line being sung brightens; all lines keep the same font metrics
     // so highlighting cannot rewrap the words during a transition.
     // A line takes 300 ms to light up or fade.
-    let quiet = palette.text.gamma_multiply(0.68);
+    let quiet = palette.text.gamma_multiply(0.38);
     ui.spacing_mut().scroll.fade.strength = 0.0;
     egui::ScrollArea::vertical()
         .id_salt(("fullscreen-lyrics-scroll", &now.uri))
@@ -780,12 +842,18 @@ fn fullscreen_contents(app: &mut App, ui: &mut egui::Ui) {
                     is_active,
                     crate::motion::seconds(ui.ctx(), 0.3),
                 );
+                let sweep = (is_active && !crate::motion::reduced(ui.ctx()))
+                    .then(|| line_progress(&lyrics, index, now.position_ms))
+                    .flatten();
                 let color = if lyrics.synced {
-                    blend(quiet, palette.text, lit)
+                    blend(
+                        quiet,
+                        palette.text,
+                        lit * if sweep.is_some() { 0.35 } else { 1.0 },
+                    )
                 } else {
                     palette.text
                 };
-                let font = theme::bold(size);
                 // A timed line with no words is the band playing on.
                 let text = if line.text.is_empty() && lyrics.synced {
                     "\u{266a}"
@@ -797,23 +865,14 @@ fn fullscreen_contents(app: &mut App, ui: &mut egui::Ui) {
                 } else {
                     Sense::hover()
                 };
-                let galley = crate::bidi::layout(
-                    ui.painter(),
-                    text,
-                    font,
-                    color,
-                    ui.available_width(),
-                    usize::MAX,
-                    None,
-                );
-                let center = ui.cursor().top() + galley.size().y * 0.5;
+                let center = ui.cursor().top() + size * 0.6;
                 let edge = ((center - viewport.top()).min(viewport.bottom() - center)
                     / (size * 2.0))
                     .clamp(0.0, 1.0);
                 let response = ui
                     .scope(|ui| {
                         ui.multiply_opacity(edge * edge * (3.0 - 2.0 * edge));
-                        ui.add(egui::Label::new(galley).sense(sense))
+                        lyric_label(ui, text, size, color, sense, sweep)
                     })
                     .inner;
                 let rect = response.rect;
@@ -869,7 +928,24 @@ fn fullscreen_contents(app: &mut App, ui: &mut egui::Ui) {
 
 #[cfg(test)]
 mod tests {
-    use super::{fullscreen_content_width, preferred_backdrop_art};
+    use super::{fullscreen_content_width, line_progress, preferred_backdrop_art};
+
+    #[test]
+    fn sweep_uses_line_bounds_and_handles_seeks_and_missing_end() {
+        let lyrics = crate::lyrics::Lyrics {
+            lines: crate::lyrics::parse_lrc(
+                "[00:05]First line\n[00:09]Second line\n[00:09]Same timestamp",
+            ),
+            synced: true,
+            instrumental: false,
+        };
+        assert_eq!(line_progress(&lyrics, 0, 3_000), Some(0.0));
+        assert_eq!(line_progress(&lyrics, 0, 7_000), Some(0.5));
+        assert_eq!(line_progress(&lyrics, 0, 20_000), Some(1.0));
+        assert_eq!(line_progress(&lyrics, 1, 9_000), None);
+        assert_eq!(line_progress(&lyrics, 2, 10_000), None);
+        assert_eq!(line_progress(&lyrics, 99, 10_000), None);
+    }
 
     #[test]
     fn fullscreen_backdrop_prefers_small_art_with_large_art_as_fallback() {
