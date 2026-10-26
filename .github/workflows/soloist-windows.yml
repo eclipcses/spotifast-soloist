@@ -6,6 +6,11 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Retry an existing release tag, for example v0.14.3; leave empty for checks only'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -25,6 +30,8 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -40,6 +47,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python .github/scripts/check-review-evidence.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($required in @('packaging/windows/spotifast-installer.txt', 'packaging/spotifast-portable.txt', 'packaging/windows/build-msi.py')) {
+            if (-not (Test-Path -LiteralPath $required)) { throw "Missing packaging input: $required" }
+          }
           node --test packaging/soloist-release.test.cjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo fmt --all --check
@@ -55,14 +65,18 @@ jobs:
 
   release:
     name: Build signed Windows release
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && startsWith(inputs.release_tag, 'v'))
     needs: validate
     runs-on: windows-latest
     timeout-minutes: 60
     permissions:
       contents: write
+    env:
+      FORK_RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -72,7 +86,10 @@ jobs:
         shell: pwsh
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
-          if ($env:GITHUB_REF_NAME -ne "v$version") { throw 'Tag does not match Cargo.toml' }
+          if ($env:FORK_RELEASE_TAG -ne "v$version") { throw 'Tag does not match Cargo.toml' }
+          foreach ($required in @('packaging/windows/spotifast-installer.txt', 'packaging/spotifast-portable.txt', 'packaging/windows/build-msi.py')) {
+            if (-not (Test-Path -LiteralPath $required)) { throw "Missing packaging input: $required" }
+          }
           cargo build --release --locked --no-default-features --target x86_64-pc-windows-msvc --bin spotifast
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $binary = 'target\x86_64-pc-windows-msvc\release\spotifast.exe'
@@ -82,10 +99,17 @@ jobs:
           if ($imports -match 'MSVCP[0-9_]*\.dll|VCRUNTIME[0-9_]*\.dll') { throw 'Executable requires an external MSVC runtime' }
           $headers = & dumpbin /headers $binary | Out-String
           if ($headers -notmatch '8664 machine \(x64\)') { throw 'Executable is not Windows x64' }
+      - name: Preserve verified binary for packaging diagnostics
+        uses: actions/upload-artifact@v7
+        with:
+          name: soloist-windows-${{ env.FORK_RELEASE_TAG }}
+          path: target/x86_64-pc-windows-msvc/release/spotifast.exe
+          retention-days: 7
+          if-no-files-found: error
       - name: Portable package and Inno installer
         shell: pwsh
         run: |
-          $version = $env:GITHUB_REF_NAME.Substring(1)
+          $version = $env:FORK_RELEASE_TAG.Substring(1)
           $stem = "spotifast-v$version-x86_64-pc-windows-msvc"
           $payload = Join-Path $env:RUNNER_TEMP $stem
           New-Item -ItemType Directory -Path $payload -Force | Out-Null
@@ -101,10 +125,10 @@ jobs:
           dotnet tool install wix --version 5.0.2 --tool-path "$env:RUNNER_TEMP\wix"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:PATH = "$env:RUNNER_TEMP\wix;$env:PATH"
-          $version = $env:GITHUB_REF_NAME.Substring(1)
+          $version = $env:FORK_RELEASE_TAG.Substring(1)
           $payload = Join-Path $env:RUNNER_TEMP 'soloist-msi-payload'
           New-Item -ItemType Directory -Path $payload | Out-Null
-          Copy-Item target/x86_64-pc-windows-msvc/release/spotifast.exe,LICENSE,README.md,packaging/spotifast-installer.txt $payload
+          Copy-Item target/x86_64-pc-windows-msvc/release/spotifast.exe,LICENSE,README.md,packaging/windows/spotifast-installer.txt $payload
           python packaging/windows/build-msi.py $payload "dist/spotifast-v$version-x86_64-pc-windows-msvc.msi" $version amd64
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Sign and verify release manifest
@@ -112,7 +136,7 @@ jobs:
           SPOTIFAST_UPDATE_SIGNING_KEY: ${{ secrets.SPOTIFAST_UPDATE_SIGNING_KEY }}
         shell: pwsh
         run: |
-          $version = $env:GITHUB_REF_NAME.Substring(1)
+          $version = $env:FORK_RELEASE_TAG.Substring(1)
           node packaging/soloist-release.cjs dist $version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Publish
@@ -120,5 +144,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
-          gh release create $env:GITHUB_REF_NAME dist/* --verify-tag --title "Spotifast Soloist $env:GITHUB_REF_NAME" --notes-file "packaging/release-notes/$env:GITHUB_REF_NAME.md" --latest
+          gh release create $env:FORK_RELEASE_TAG dist/* --verify-tag --title "Spotifast Soloist $env:FORK_RELEASE_TAG" --notes-file "packaging/release-notes/$env:FORK_RELEASE_TAG.md" --latest
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
