@@ -222,13 +222,13 @@ The Web API and librespot do not provide these features:
 - **Lossless audio.** librespot does not receive lossless streams. Spotifast
   will reconsider this if librespot gains lawful support, but it will not
   bypass Spotify's DRM.
-- **Soloist as the player.** Spotify's Soloist plays lossless and works with
-  Spotify Connect, but Spotify ships it only for Linux and does not allow apps
-  to bundle it. Each listener would need their own developer key and pairing,
-  builds stop working after 90 days, and it has no API for the library,
-  playlists or search, and no way to feed the equalizer and visualisers.
-  Spotifast will reconsider it if Spotify offers a supported desktop path.
-  See [issue #965](https://github.com/crmne/spotifast/issues/965).
+- **Soloist as an embedded player.** Spotify now supplies a Windows x86_64
+  executable, but it cannot be bundled with Spotifast. This personal Windows
+  build can launch a user-supplied Soloist executable and control it as a
+  Spotify Connect device. Each listener needs their own developer key and
+  initial pairing. Builds expire after 90 days. Library and search still
+  use Spotifast's Web API integration; the equalizer and visualisers cannot
+  read Soloist's audio. See `SOLOIST-WINDOWS.md` in this checkout for setup.
 - **Local files from Spotify's Local Files playlist.** librespot cannot play
   that playlist; add the songs to another playlist first. Local files on other
   computers or phones are not shared either: Spotify keeps only their names.

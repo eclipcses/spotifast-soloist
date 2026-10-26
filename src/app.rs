@@ -307,6 +307,8 @@ pub enum PlayCountRead {
 const PLAY_COUNT_RETRY: Duration = Duration::from_secs(60);
 
 pub struct App {
+    #[cfg(windows)]
+    pub soloist: crate::soloist::Form,
     pub dirs: AppDirs,
     pub settings: Settings,
     /// Proxy policy actually handed to network workers. Manual form edits are
@@ -1108,6 +1110,8 @@ impl App {
             local_transfer_sequence: None,
             local_ready: false,
             local_playback: LocalPlayback::Unavailable,
+            #[cfg(windows)]
+            soloist: crate::soloist::Form::default(),
             local: LocalState::default(),
             remote: None,
             remote_polled_at: Instant::now() - REMOTE_POLL_UNSEEN,
@@ -2451,9 +2455,17 @@ impl App {
 
     fn handle_backend_events(&mut self, events: Vec<Event>) {
         for event in events {
+            #[cfg(windows)]
+            let local_soloist_event = matches!(
+                &event,
+                Event::Soloist(_) | Event::SoloistExecutableChosen(_)
+            );
+            #[cfg(not(windows))]
+            let local_soloist_event = false;
             // Offline, as in demo mode, only colours read from cover art and
             // local update checks come through.
             if self.offline
+                && !local_soloist_event
                 && !matches!(&event, Event::Accent { .. })
                 && (self.update_source.is_github()
                     || !matches!(
@@ -2468,6 +2480,26 @@ impl App {
                 continue;
             }
             match event {
+                #[cfg(windows)]
+                Event::SoloistExecutableChosen(path) => {
+                    if let Some(path) = path {
+                        self.soloist.choose_executable(path);
+                    }
+                }
+                #[cfg(windows)]
+                Event::Soloist(result) => match result {
+                    Ok(active) => {
+                        self.soloist.active = active;
+                        if active {
+                            self.backend.api(ApiRequest::Devices);
+                        }
+                    }
+                    Err(message) => {
+                        self.soloist.active = false;
+                        self.soloist.open = true;
+                        self.toast_error(message);
+                    }
+                },
                 Event::PlaylistCoverChecked {
                     id,
                     request,
@@ -12003,6 +12035,8 @@ impl App {
                     self.backend.send(Command::AuthorizePlayback);
                 }
             }
+            #[cfg(windows)]
+            Action::SetupSoloist => self.soloist.open = true,
             Action::SetPrereleaseSaved { uri, saved } => {
                 if self.local_ready {
                     for page in self.album_pages.values_mut() {
@@ -12989,6 +13023,26 @@ impl App {
             crate::ui::show(self, ui);
         }
         self.apply_actions(ctx);
+        #[cfg(windows)]
+        if let Some(action) = self.soloist.show(ctx) {
+            match action {
+                crate::soloist::FormAction::Browse => {
+                    let selected = rfd::AsyncFileDialog::new()
+                        .set_title("Choose Spotify's soloist.exe")
+                        .add_filter("Windows executable", &["exe"])
+                        .pick_file();
+                    self.backend.send(Command::ChooseSoloistExecutable {
+                        selected: Box::pin(selected),
+                    });
+                }
+                crate::soloist::FormAction::Start(setup) => {
+                    self.backend.send(Command::StartSoloist(setup));
+                }
+                crate::soloist::FormAction::Forget => {
+                    self.backend.send(Command::ForgetSoloist);
+                }
+            }
+        }
         let autoscroll = self.autoscroll.finish(
             ctx,
             crate::autoscroll::enabled(self.settings.middle_click_autoscroll),

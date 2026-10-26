@@ -701,6 +701,15 @@ pub fn autostart() -> fastframe_autostart::Autostart {
 }
 
 pub enum Command {
+    #[cfg(windows)]
+    ChooseSoloistExecutable {
+        selected:
+            std::pin::Pin<Box<dyn std::future::Future<Output = Option<rfd::FileHandle>> + Send>>,
+    },
+    #[cfg(windows)]
+    StartSoloist(Option<crate::soloist::Setup>),
+    #[cfg(windows)]
+    ForgetSoloist,
     OpenThemesFolder,
     /// Read or change the login registration, off the UI thread: it reads
     /// and writes a file, the registry or D-Bus, and the Flatpak portal may
@@ -965,6 +974,10 @@ pub struct LyricsRequest {
 }
 
 pub enum Event {
+    #[cfg(windows)]
+    SoloistExecutableChosen(Option<std::path::PathBuf>),
+    #[cfg(windows)]
+    Soloist(Result<bool, String>),
     /// The folder picked in the local files dialog; `None` when cancelled.
     LocalFilesFolderChosen(Option<std::path::PathBuf>),
     /// The songs in `folder`, by the `spotify:local:` URIs they play for.
@@ -1246,6 +1259,8 @@ impl Backend {
                         waker,
                     );
                     if restore_sign_in {
+                        #[cfg(all(windows, not(test)))]
+                        worker.start_soloist(None, true).await;
                         worker.restore_session();
                     }
                     worker.run(command_rx).await;
@@ -1330,6 +1345,16 @@ impl Backend {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(cache.clone());
+        }
+        #[cfg(windows)]
+        if matches!(
+            &command,
+            Command::StartSoloist(_)
+                | Command::ForgetSoloist
+                | Command::ChooseSoloistExecutable { .. }
+        ) {
+            let _ = self.commands.send(command);
+            return;
         }
         if self.offline
             && !matches!(
@@ -1828,6 +1853,10 @@ struct Worker {
     authorization_attempt: u64,
     session: watch::Sender<u64>,
     engine_config: EngineConfig,
+    #[cfg(windows)]
+    soloist: Option<crate::soloist::Process>,
+    #[cfg(windows)]
+    soloist_mode: bool,
     /// The resolved proxy handed to the current or in-flight engine connection.
     engine_proxy: Option<reqwest::Url>,
     web_client_id: Option<String>,
@@ -1954,6 +1983,10 @@ impl Worker {
             dirs,
             engine_config,
             engine_proxy: None,
+            #[cfg(windows)]
+            soloist: None,
+            #[cfg(windows)]
+            soloist_mode: false,
             web_client_id,
             api: Arc::new(ApiGateway::new(http.clone(), activity)),
             made_for_you: Arc::new(crate::made_for_you::MadeForYou::new(http.clone())),
@@ -2137,13 +2170,28 @@ impl Worker {
     }
 
     async fn run(&mut self, mut commands: mpsc::UnboundedReceiver<Command>) {
+        #[cfg(windows)]
+        let mut soloist_poll = tokio::time::interval(Duration::from_secs(2));
+        #[cfg(windows)]
+        soloist_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let (cache_writes, cache_write_receiver) = mpsc::channel(1);
         let cache_writer = tokio::spawn(store_playlist_caches(
             cache_write_receiver,
             self.events.clone(),
             self.waker.clone(),
         ));
-        while let Some(command) = commands.recv().await {
+        loop {
+            #[cfg(windows)]
+            let command = tokio::select! {
+                command = commands.recv() => command,
+                _ = soloist_poll.tick(), if self.soloist.is_some() => {
+                    self.check_soloist();
+                    continue;
+                }
+            };
+            #[cfg(not(windows))]
+            let command = commands.recv().await;
+            let Some(command) = command else { break };
             if self.restoring_proxy
                 && !matches!(
                     &command,
@@ -2159,6 +2207,20 @@ impl Worker {
                 continue;
             }
             match command {
+                #[cfg(windows)]
+                Command::ChooseSoloistExecutable { selected } => {
+                    let events = self.events.clone();
+                    let waker = self.waker.clone();
+                    tokio::spawn(async move {
+                        let path = selected.await.map(|file| file.path().to_path_buf());
+                        let _ = events.send(Event::SoloistExecutableChosen(path));
+                        waker.wake();
+                    });
+                }
+                #[cfg(windows)]
+                Command::StartSoloist(setup) => self.start_soloist(setup, false).await,
+                #[cfg(windows)]
+                Command::ForgetSoloist => self.forget_soloist().await,
                 Command::ListOutputDevices => {
                     let events = self.events.clone();
                     let waker = self.waker.clone();
@@ -2313,6 +2375,10 @@ impl Worker {
                     self.pending_authorization = None;
                 }
                 Command::SignOut => {
+                    #[cfg(windows)]
+                    if self.soloist_mode {
+                        self.forget_soloist().await;
+                    }
                     self.sign_out();
                     // The account caches go in command order, so nothing a
                     // sign-in after this stores goes with them. This loop
@@ -2869,6 +2935,8 @@ impl Worker {
         if let Some(engine) = self.engine.take() {
             engine.shutdown();
         }
+        #[cfg(windows)]
+        drop(self.soloist.take());
         self.stop_kept_player();
         drop(cache_writes);
         let _ = cache_writer.await;
@@ -3431,6 +3499,94 @@ impl Worker {
 
     // ---- local playback engine -------------------------------------------
 
+    #[cfg(windows)]
+    async fn start_soloist(&mut self, setup: Option<crate::soloist::Setup>, quiet: bool) {
+        let state = self.dirs.state.clone();
+        // Credential Manager and process startup must never block the UI.
+        // A missing saved setup is normal on an unchanged installation.
+        let prepared = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let setup = match setup {
+                Some(setup) => setup,
+                None => match crate::credentials::soloist_setup(&state)? {
+                    Some(setup) => setup,
+                    None => return Ok(None),
+                },
+            };
+            setup.validate()?;
+            crate::credentials::save_soloist_setup(&state, &setup)?;
+            Ok(Some(setup))
+        })
+        .await;
+        let setup = match prepared {
+            Ok(Ok(Some(setup))) => setup,
+            Ok(Ok(None)) => {
+                if !quiet {
+                    self.emit(Event::Soloist(Err("No saved Soloist setup. Enter the executable path and your API key, then choose Save and start.".into())));
+                }
+                return;
+            }
+            _ => {
+                if quiet {
+                    self.soloist_mode = true;
+                }
+                self.emit(Event::Soloist(Err("Couldn't load or save Soloist setup. Check the executable path and Windows Credential Manager.".into())));
+                return;
+            }
+        };
+        self.soloist_mode = true;
+        self.engine_attempt = self.engine_attempt.wrapping_add(1);
+        self.engine_busy = false;
+        self.cancel_engine_retry();
+        self.take_engine_for_resume();
+        self.resume = None;
+        drop(self.soloist.take());
+        self.emit(Event::Playback(LocalPlayback::Unavailable));
+        let data = self.dirs.state.join("soloist");
+        let cache = self.dirs.cache.join("soloist");
+        let started = tokio::task::spawn_blocking(move || {
+            crate::soloist::Process::start(&setup, &data, &cache)
+        })
+        .await;
+        match started {
+            Ok(Ok(process)) => {
+                self.soloist = Some(process);
+                self.emit(Event::Soloist(Ok(true)));
+            }
+            _ => self.emit(Event::Soloist(Err("Couldn't start Soloist. Check its executable, API key and build expiry, then start it again from Soloist playback.".into()))),
+        }
+    }
+
+    #[cfg(windows)]
+    fn check_soloist(&mut self) {
+        let Some(process) = self.soloist.as_mut() else {
+            return;
+        };
+        let message = match process.exited() {
+            Ok(None) => return,
+            Ok(Some(status)) if status.code() == Some(10) => {
+                "Soloist expired. Download a newer Windows build and start it again from Soloist playback."
+            }
+            _ => {
+                "Soloist stopped. Check its API key, Windows audio output and build version, then start it again from Soloist playback."
+            }
+        };
+        drop(self.soloist.take());
+        self.emit(Event::Soloist(Err(message.into())));
+    }
+
+    #[cfg(windows)]
+    async fn forget_soloist(&mut self) {
+        drop(self.soloist.take());
+        let state = self.dirs.state.clone();
+        match tokio::task::spawn_blocking(move || crate::credentials::forget_soloist_setup(&state)).await {
+            Ok(Ok(())) => {
+                self.soloist_mode = false;
+                self.emit(Event::Soloist(Ok(false)));
+            }
+            _ => self.emit(Event::Soloist(Err("Soloist stopped, but its saved setup or pairing could not be removed. Try Stop and forget setup again.".into()))),
+        }
+    }
+
     fn on_playback_authorized(&mut self, access_token: String) {
         let Some(credentials) = playback_credentials(self.api.account(), access_token) else {
             self.engine_busy = false;
@@ -3470,6 +3626,10 @@ impl Worker {
     /// Bring the engine up from a credential stored by a previous playback
     /// authorization, if there is one. Silent when there is nothing to resume.
     fn resume_engine(&mut self) {
+        #[cfg(windows)]
+        if self.soloist_mode {
+            return;
+        }
         if !self.signed_in
             || self.engine.is_some()
             || self.engine_busy
@@ -3651,6 +3811,11 @@ impl Worker {
     /// account is tried first; the browser opens only when there is none or
     /// Spotify rejects it (#818, #824).
     fn authorize_playback(&mut self) {
+        #[cfg(windows)]
+        if self.soloist_mode {
+            self.emit(Event::Error("Soloist handles playback. Select its device in Spotifast's device picker; use Soloist playback in Settings to restart it.".into()));
+            return;
+        }
         if self.cancel_signin.is_some() {
             return;
         }
@@ -3768,6 +3933,10 @@ impl Worker {
     /// on "Connecting to Spotify"). Reusable credentials stay in memory until
     /// this worker receives the connected engine and persists them securely.
     fn connect_engine(&mut self, credentials: Credentials) {
+        #[cfg(windows)]
+        if self.soloist_mode {
+            return;
+        }
         if let Err(error) = self.http.client() {
             self.pending_playback_grant = None;
             self.emit(Event::Playback(LocalPlayback::Failed(error)));
@@ -8358,6 +8527,26 @@ mod authorization_tests {
 
     /// Tests that bind the personal app's callback port take turns.
     static WEB_PORT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(windows)]
+    #[test]
+    fn soloist_mode_does_not_start_librespot_or_open_its_login_flow() {
+        let (runtime, mut worker, events) = worker("soloist-no-librespot");
+        let _entered = runtime.enter();
+        worker.signed_in = true;
+        worker.premium = Some(true);
+        worker.soloist_mode = true;
+        worker.resume_engine();
+        worker.authorize_playback();
+        assert!(!worker.engine_busy);
+        assert!(worker.engine.is_none());
+        assert!(worker.cancel_signin.is_none());
+        let received: Vec<_> = events.try_iter().collect();
+        assert_eq!(received.len(), 1);
+        assert!(
+            matches!(&received[0], Event::Error(message) if message.contains("Soloist handles playback"))
+        );
+    }
 
     #[test]
     fn occupied_login_port_reports_persistent_failure_before_browser_sign_in() {

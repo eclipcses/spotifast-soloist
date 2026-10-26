@@ -1356,6 +1356,8 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
                 });
             }
             "personal-app" => app.dialog = Some(Dialog::PersonalAppIntro),
+            #[cfg(windows)]
+            "soloist-setup" => app.soloist.open = true,
             "slow-banner" => app.slow_banner = true,
             "audio-key-banner" => app.audio_key_banner = true,
             "many-devices" => {

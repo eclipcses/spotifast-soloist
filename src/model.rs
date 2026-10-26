@@ -1379,6 +1379,8 @@ pub enum Action {
     ApplyProxy,
     ProxyEdited,
     EnablePlayback,
+    #[cfg(windows)]
+    SetupSoloist,
     ShowWindow,
     HideWindow,
     ClearArtCache,

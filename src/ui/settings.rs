@@ -751,6 +751,17 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 {
                     app.actions.push(Action::RestartEngine);
                 }
+                #[cfg(windows)]
+                if ui
+                    .button(if app.soloist.active {
+                        "Soloist playback (running)"
+                    } else {
+                        "Soloist playback"
+                    })
+                    .clicked()
+                {
+                    app.actions.push(Action::SetupSoloist);
+                }
             });
             filtered_row(ui, &palette, &needle, &playback, &playback_rows[1], |ui| {
                 let response = Frame::new()

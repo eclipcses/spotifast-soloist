@@ -6,6 +6,18 @@ nav_order: 1
 
 ## Independent grants, once each
 
+In this personal Windows build, Settings also offers **Soloist playback**.
+When configured, Spotifast starts a user-supplied official Soloist executable
+without a console and stops librespot playback. Soloist authenticates through
+Spotify Connect pairing; the interface controls it using the existing Web API
+device controls. Its developer key and executable path are saved in Windows
+Credential Manager, while its pairing state is in the profile's `soloist`
+state subfolder. Signing out forgets both. The API key is never written to
+Spotifast's JSON files or logs. Soloist runs until Spotifast exits, including
+while Spotifast is in the tray. No additional local API port is opened.
+Session-only reads described below may be unavailable in this mode. See
+`SOLOIST-WINDOWS.md` for setup, build expiry and audio-feature limitations.
+
 Spotifast uses separate credentials for Web API access and local playback:
 
 1. **Your own Spotify app**, the personal app, carries the Web API: account,

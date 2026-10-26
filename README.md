@@ -171,3 +171,8 @@ Licensed under the [MIT License](LICENSE).
     <img alt="Spotifast GitHub stars over time" src="https://api.star-history.com/chart?repos=crmne/spotifast&amp;type=date">
   </picture>
 </a>
+
+## Personal Windows build: Soloist playback
+
+This checkout adds optional official Soloist playback behind the existing
+Spotifast interface. See [setup and limitations](SOLOIST-WINDOWS.md).

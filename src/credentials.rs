@@ -260,6 +260,52 @@ struct NativeStore {
     store: Option<Arc<keyring_core::api::CredentialStore>>,
 }
 
+/// Soloist's developer key and executable are kept together in the native
+/// protected store, scoped to this Spotifast profile. Call off the UI thread.
+#[cfg(windows)]
+pub(crate) fn soloist_setup(state: &Path) -> anyhow::Result<Option<crate::soloist::Setup>> {
+    if state.join("soloist-disabled").try_exists()? {
+        return Ok(None);
+    }
+    let key = format!("soloist-{}", profile_of(state));
+    NativeStore::default()
+        .read(&key)?
+        .map(|bytes| serde_json::from_slice(&bytes).map_err(anyhow::Error::from))
+        .transpose()
+}
+
+#[cfg(windows)]
+pub(crate) fn save_soloist_setup(
+    state: &Path,
+    setup: &crate::soloist::Setup,
+) -> anyhow::Result<()> {
+    let key = format!("soloist-{}", profile_of(state));
+    NativeStore::default().write(&key, &serde_json::to_vec(setup)?)?;
+    match std::fs::remove_file(state.join("soloist-disabled")) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn forget_soloist_setup(state: &Path) -> anyhow::Result<()> {
+    // Revoke restoration before touching Credential Manager. A locked store
+    // must not silently restore the previous account after sign-out.
+    fastframe_file::write(&state.join("soloist-disabled"), b"disabled")?;
+    let deleted = NativeStore::default().delete(&format!("soloist-{}", profile_of(state)));
+    let data = state.join("soloist");
+    let cleaned = match std::fs::remove_dir_all(data) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    };
+    deleted?;
+    cleaned?;
+    Ok(())
+}
+
 impl NativeStore {
     fn entry(&mut self, key: &str) -> Result<keyring_core::Entry, Error> {
         self.entry_with(key, None)
