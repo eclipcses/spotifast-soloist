@@ -36,11 +36,36 @@ fn blend(from: egui::Color32, to: egui::Color32, t: f32) -> egui::Color32 {
 /// A decorative sweep estimated from line timestamps, not word alignment.
 /// Keep the final line steady: its end is unknown, and instrumental tails
 /// would otherwise make the words crawl for the rest of the recording.
-fn line_progress(lyrics: &crate::lyrics::Lyrics, index: usize, position: u32) -> Option<f32> {
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Sweep {
+    Estimated(f32),
+    TimedBytes(f32),
+}
+
+fn line_progress(lyrics: &crate::lyrics::Lyrics, index: usize, position: u32) -> Option<Sweep> {
+    let line = lyrics.lines.get(index)?;
+    if !line.words.is_empty() {
+        let mut boundary = 0.0;
+        for word in &line.words {
+            if position < word.start_ms {
+                break;
+            }
+            if position >= word.end_ms {
+                boundary = word.end_byte as f32;
+                continue;
+            }
+            let progress = (position - word.start_ms) as f32 / (word.end_ms - word.start_ms) as f32;
+            boundary = word.start_byte as f32 + (word.end_byte - word.start_byte) as f32 * progress;
+            break;
+        }
+        return Some(Sweep::TimedBytes(boundary));
+    }
     let start = lyrics.lines.get(index)?.at_ms?;
     let end = lyrics.lines.get(index + 1)?.at_ms?;
     let duration = end.checked_sub(start).filter(|duration| *duration > 0)?;
-    Some((position.saturating_sub(start) as f32 / duration as f32).clamp(0.0, 1.0))
+    Some(Sweep::Estimated(
+        (position.saturating_sub(start) as f32 / duration as f32).clamp(0.0, 1.0),
+    ))
 }
 
 /// Paint the same shaped text twice, clipping the bright layer row by row.
@@ -51,7 +76,7 @@ fn lyric_label(
     size: f32,
     color: Color32,
     sense: Sense,
-    sweep: Option<f32>,
+    sweep: Option<Sweep>,
 ) -> egui::Response {
     let galley = crate::bidi::layout(
         ui.painter(),
@@ -66,11 +91,39 @@ fn lyric_label(
     if let Some(progress) = sweep {
         let origin = crate::bidi::galley_pos(response.rect, &galley);
         let total: f32 = galley.rows.iter().map(|row| row.rect().width()).sum();
-        let mut remaining = total * progress;
+        let mut remaining = match progress {
+            Sweep::Estimated(ratio) => total * ratio,
+            Sweep::TimedBytes(_) => 0.0,
+        };
         for row in &galley.rows {
             let mut clip = row.rect().translate(origin.to_vec2());
-            let width = remaining.clamp(0.0, clip.width());
-            remaining -= clip.width();
+            let width = match progress {
+                Sweep::Estimated(_) => {
+                    let width = remaining.clamp(0.0, clip.width());
+                    remaining -= clip.width();
+                    width
+                }
+                Sweep::TimedBytes(boundary) => {
+                    let mut whole = 0.0;
+                    let mut bright = 0.0;
+                    for glyph in &row.row.glyphs {
+                        let byte = glyph.cluster as usize;
+                        let end = text
+                            .get(byte..)
+                            .and_then(|tail| tail.chars().next())
+                            .map_or(byte + 1, |c| byte + c.len_utf8());
+                        let amount =
+                            ((boundary - byte as f32) / (end - byte) as f32).clamp(0.0, 1.0);
+                        whole += glyph.advance_width;
+                        bright += glyph.advance_width * amount;
+                    }
+                    if whole > 0.0 {
+                        clip.width() * bright / whole
+                    } else {
+                        0.0
+                    }
+                }
+            };
             if width <= 0.0 {
                 continue;
             }
@@ -260,9 +313,13 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
     let active = lyrics.active_line(now.position_ms);
     if now.playing
         && !crate::motion::reduced(ui.ctx())
-        && active
-            .and_then(|index| line_progress(&lyrics, index, now.position_ms))
-            .is_some()
+        && active.is_some_and(|index| {
+            line_progress(&lyrics, index, now.position_ms).is_some()
+                && lyrics.lines[index]
+                    .words
+                    .last()
+                    .is_none_or(|word| now.position_ms < word.end_ms)
+        })
     {
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(33));
@@ -778,9 +835,13 @@ fn fullscreen_contents(app: &mut App, ui: &mut egui::Ui) {
     let active = lyrics.active_line(now.position_ms);
     if now.playing
         && !crate::motion::reduced(ui.ctx())
-        && active
-            .and_then(|index| line_progress(&lyrics, index, now.position_ms))
-            .is_some()
+        && active.is_some_and(|index| {
+            line_progress(&lyrics, index, now.position_ms).is_some()
+                && lyrics.lines[index]
+                    .words
+                    .last()
+                    .is_none_or(|word| now.position_ms < word.end_ms)
+        })
     {
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(33));
@@ -928,7 +989,26 @@ fn fullscreen_contents(app: &mut App, ui: &mut egui::Ui) {
 
 #[cfg(test)]
 mod tests {
-    use super::{fullscreen_content_width, line_progress, preferred_backdrop_art};
+    use super::{Sweep, fullscreen_content_width, line_progress, preferred_backdrop_art};
+
+    #[test]
+    fn real_timing_holds_between_words_and_follows_seeks_on_final_line() {
+        let lyrics = crate::lyrics::from_ttml("<tt><body><p begin='0'><span begin='0' end='1'>Hi</span> <span begin='3' end='4'>you</span></p></body></tt>").unwrap();
+        assert_eq!(line_progress(&lyrics, 0, 500), Some(Sweep::TimedBytes(1.0)));
+        assert_eq!(
+            line_progress(&lyrics, 0, 2000),
+            Some(Sweep::TimedBytes(2.0))
+        );
+        assert_eq!(
+            line_progress(&lyrics, 0, 3500),
+            Some(Sweep::TimedBytes(4.5))
+        );
+        assert_eq!(
+            line_progress(&lyrics, 0, 9000),
+            Some(Sweep::TimedBytes(6.0))
+        );
+        assert_eq!(line_progress(&lyrics, 0, 0), Some(Sweep::TimedBytes(0.0)));
+    }
 
     #[test]
     fn sweep_uses_line_bounds_and_handles_seeks_and_missing_end() {
@@ -939,9 +1019,18 @@ mod tests {
             synced: true,
             instrumental: false,
         };
-        assert_eq!(line_progress(&lyrics, 0, 3_000), Some(0.0));
-        assert_eq!(line_progress(&lyrics, 0, 7_000), Some(0.5));
-        assert_eq!(line_progress(&lyrics, 0, 20_000), Some(1.0));
+        assert_eq!(
+            line_progress(&lyrics, 0, 3_000),
+            Some(Sweep::Estimated(0.0))
+        );
+        assert_eq!(
+            line_progress(&lyrics, 0, 7_000),
+            Some(Sweep::Estimated(0.5))
+        );
+        assert_eq!(
+            line_progress(&lyrics, 0, 20_000),
+            Some(Sweep::Estimated(1.0))
+        );
         assert_eq!(line_progress(&lyrics, 1, 9_000), None);
         assert_eq!(line_progress(&lyrics, 2, 10_000), None);
         assert_eq!(line_progress(&lyrics, 99, 10_000), None);

@@ -4736,9 +4736,8 @@ impl Worker {
         let cache_dir = self.dirs.lyrics_cache_dir();
         let engine = self.engine.clone();
         tokio::spawn(async move {
-            // A local file's own words go first, then Spotify's: they
-            // follow the recording exactly. Everything else, a signed-out
-            // session included, falls back to LRCLIB.
+            // Keep local lyrics first. Try actual word timings before
+            // Spotify's line timings, with LRCLIB as the final fallback.
             let own = match request.local_file {
                 Some(file) => tokio::task::spawn_blocking(move || crate::local_tags::lyrics(&file))
                     .await
@@ -4746,7 +4745,15 @@ impl Worker {
                     .flatten(),
                 None => None,
             };
-            let exact = match own {
+            let words = if own.is_none() {
+                match &http {
+                    Ok(http) => crate::lyrics::fetch_words(http, &cache_dir, &request.query).await,
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            let exact = match own.or(words) {
                 Some(found) => Some(found),
                 None => spotify_lyrics(engine, &request.uri, &cache_dir).await,
             };

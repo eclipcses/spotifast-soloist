@@ -1,8 +1,8 @@
-//! Lyrics for the playing track, from Spotify, a local file or LRCLIB.
+//! Lyrics for the playing track, with Better Lyrics word-timed TTML and
+//! local-file, Spotify and LRCLIB fallbacks.
 //!
-//! [LRCLIB](https://lrclib.net) provides plain and LRC-synced lyrics without an
-//! account or key. Spotifast tries Spotify's transcription first when the
-//! playback session is signed in, then LRCLIB.
+//! Better Lyrics is optional and cache-first; unavailable word timing never
+//! prevents the existing line-synced or plain lyrics from being shown.
 //!
 //! Matching starts with an exact lookup, then ranks search results. Track
 //! length is the strongest signal for distinguishing versions with the same
@@ -43,6 +43,17 @@ pub struct Line {
     /// When the line starts; `None` in lyrics that carry no timing.
     pub at_ms: Option<u32>,
     pub text: String,
+    /// Byte ranges in text paired with actual provider timestamps.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub words: Vec<Word>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Word {
+    pub start_ms: u32,
+    pub end_ms: u32,
+    pub start_byte: usize,
+    pub end_byte: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,6 +102,7 @@ pub fn from_spotify(json: &serde_json::Value) -> Option<Lyrics> {
                 })
                 .filter(|_| synced);
             Some(Line {
+                words: Vec::new(),
                 at_ms,
                 text: text.to_string(),
             })
@@ -105,6 +117,192 @@ pub fn from_spotify(json: &serde_json::Value) -> Option<Lyrics> {
         synced,
         instrumental: false,
     })
+}
+
+/// Prefer real word timing without making the existing lyric sources depend
+/// on this service. Only song metadata is sent; no Spotify credentials.
+pub async fn fetch_words(
+    http: &reqwest::Client,
+    cache_dir: &Path,
+    query: &Query,
+) -> Option<Lyrics> {
+    let path = cache_dir.join(format!("words-v1-{}.json", cache_key(query)));
+    if let Some(cached) = read_cache(&path) {
+        let fresh_miss = std::fs::metadata(&path)
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|at| at.elapsed().ok())
+            .is_some_and(|age| age < Duration::from_secs(6 * 60 * 60));
+        if cached.is_some() || fresh_miss {
+            return cached;
+        }
+    }
+    match better_words(http, "https://api.betterlyrics.org/getLyrics", query).await {
+        Ok(found) => {
+            write_cache(&path, &found);
+            found
+        }
+        Err(_) => None,
+    }
+}
+
+async fn better_words(http: &reqwest::Client, url: &str, query: &Query) -> Result<Option<Lyrics>> {
+    let duration = (f64::from(query.duration_ms) / 1000.0).to_string();
+    let mut response = http
+        .get(url)
+        .header(
+            reqwest::header::USER_AGENT,
+            concat!("Spotifast/", env!("CARGO_PKG_VERSION")),
+        )
+        .header(reqwest::header::ACCEPT, "application/json")
+        .query(&[
+            ("s", query.title.as_str()),
+            ("a", query.artist.as_str()),
+            ("al", query.album.as_str()),
+            ("d", duration.as_str()),
+        ])
+        .timeout(Duration::from_secs(4))
+        .send()
+        .await?;
+    if matches!(response.status().as_u16(), 401 | 403 | 404) {
+        return Ok(None);
+    }
+    response.error_for_status_ref()?;
+    const MAX_BYTES: usize = 4 * 1024 * 1024;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        anyhow::ensure!(
+            bytes.len() + chunk.len() <= MAX_BYTES,
+            "lyrics response too large"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    if value
+        .get("score")
+        .and_then(|v| v.as_f64())
+        .is_some_and(|score| score < 0.8)
+    {
+        return Ok(None);
+    }
+    Ok(value
+        .get("ttml")
+        .and_then(|v| v.as_str())
+        .and_then(from_ttml))
+}
+
+fn ttml_time(text: &str) -> Option<u32> {
+    if let Some(ms) = text.strip_suffix("ms") {
+        return ms.parse().ok();
+    }
+    let mut seconds = 0.0_f64;
+    let parts: Vec<_> = text.strip_suffix('s').unwrap_or(text).split(':').collect();
+    if parts.is_empty() || parts.len() > 3 {
+        return None;
+    }
+    for part in parts {
+        seconds = seconds * 60.0 + part.parse::<f64>().ok()?;
+    }
+    let ms = seconds * 1000.0;
+    (ms.is_finite() && ms >= 0.0 && ms <= f64::from(u32::MAX)).then(|| ms.round() as u32)
+}
+
+fn auxiliary(node: roxmltree::Node<'_, '_>) -> bool {
+    node.attributes().any(|attr| {
+        attr.name() == "role"
+            && matches!(
+                attr.value(),
+                "x-bg" | "x-translation" | "x-roman" | "x-transliteration"
+            )
+    })
+}
+
+/// Parse only the main vocal text. Background/translation metadata must not
+/// become extra words, and whitespace between syllable spans is significant.
+pub fn from_ttml(xml: &str) -> Option<Lyrics> {
+    let doc = roxmltree::Document::parse_with_options(
+        xml,
+        roxmltree::ParsingOptions {
+            nodes_limit: 100_000,
+            ..roxmltree::ParsingOptions::default()
+        },
+    )
+    .ok()?;
+    if doc
+        .descendants()
+        .any(|node| node.ancestors().take(65).count() > 64)
+    {
+        return None;
+    }
+    let body = doc.descendants().find(|node| node.has_tag_name("body"))?;
+    let mut lines = Vec::new();
+    for p in body.descendants().filter(|node| node.has_tag_name("p")) {
+        let Some(start) = p.attribute("begin").and_then(ttml_time) else {
+            continue;
+        };
+        let mut line = Line {
+            at_ms: Some(start),
+            ..Line::default()
+        };
+        collect_ttml(p, &mut line);
+        if line.text.trim().is_empty() {
+            continue;
+        }
+        if line
+            .words
+            .windows(2)
+            .any(|pair| pair[1].start_ms < pair[0].end_ms)
+            || line.words.iter().any(|word| word.start_ms < start)
+        {
+            line.words.clear();
+        }
+        lines.push(line);
+    }
+    lines.sort_by_key(|line| line.at_ms);
+    if !lines.iter().any(|line| !line.words.is_empty()) {
+        return None;
+    }
+    Some(Lyrics {
+        lines,
+        synced: true,
+        instrumental: false,
+    })
+}
+
+fn collect_ttml(node: roxmltree::Node<'_, '_>, line: &mut Line) {
+    if auxiliary(node) {
+        return;
+    }
+    if node.is_text() {
+        let text = node.text().unwrap_or_default();
+        if !(text.contains('\n') && text.trim().is_empty()) {
+            line.text.push_str(text);
+        }
+        return;
+    }
+    let from = line.text.len();
+    let words_before = line.words.len();
+    for child in node.children() {
+        collect_ttml(child, line);
+    }
+    // Leaf timing only: a timed wrapper must not duplicate its timed children.
+    if node.has_tag_name("span")
+        && line.words.len() == words_before
+        && let (Some(start_ms), Some(end_ms)) = (
+            node.attribute("begin").and_then(ttml_time),
+            node.attribute("end").and_then(ttml_time),
+        )
+        && end_ms > start_ms
+        && from < line.text.len()
+        && !line.text[from..].trim().is_empty()
+    {
+        line.words.push(Word {
+            start_ms,
+            end_ms,
+            start_byte: from,
+            end_byte: line.text.len(),
+        });
+    }
 }
 
 /// The cached answer at `path`, while it is fresh.
@@ -269,6 +467,7 @@ impl Record {
             lines: plain
                 .lines()
                 .map(|line| Line {
+                    words: Vec::new(),
                     at_ms: None,
                     text: line.trim_end().to_string(),
                 })
@@ -566,6 +765,7 @@ pub fn from_text(text: &str) -> Option<Lyrics> {
             .trim()
             .lines()
             .map(|line| Line {
+                words: Vec::new(),
                 at_ms: None,
                 text: line.trim_end().to_string(),
             })
@@ -595,6 +795,7 @@ pub fn parse_lrc(text: &str) -> Vec<Line> {
         let body = rest.trim();
         for at_ms in times {
             lines.push(Line {
+                words: Vec::new(),
                 at_ms: Some(at_ms),
                 text: body.to_string(),
             });
@@ -670,6 +871,111 @@ fn write_cache(path: &Path, found: &Option<Lyrics>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ttml_preserves_word_gaps_entities_and_syllables_but_skips_auxiliary_text() {
+        let xml = r#"<tt xmlns:ttm="http://www.w3.org/ns/ttml#metadata"><body><div>
+        <p begin="0:01.000" end="0:04.000"><span begin="1s" end="1500ms">Hé</span><span begin="1.5" end="2">llo</span> <span begin="3" end="4">world &amp; all</span><span ttm:role="x-bg"><span begin="1" end="4">echo</span></span><span ttm:role="x-translation">translation</span></p>
+        </div></body></tt>"#;
+        let lyrics = from_ttml(xml).unwrap();
+        assert_eq!(lyrics.lines[0].text, "Héllo world & all");
+        let words = &lyrics.lines[0].words;
+        assert_eq!(words.len(), 3);
+        assert_eq!((words[0].start_ms, words[0].end_ms), (1000, 1500));
+        assert_eq!(
+            &lyrics.lines[0].text[words[1].start_byte..words[1].end_byte],
+            "llo"
+        );
+        assert_eq!(
+            &lyrics.lines[0].text[words[2].start_byte..words[2].end_byte],
+            "world & all"
+        );
+    }
+
+    #[test]
+    fn ttml_requires_valid_real_word_timing_and_old_cache_remains_readable() {
+        assert!(from_ttml("<tt><body><p begin='1'>Plain line</p></body></tt>").is_none());
+        assert!(
+            from_ttml(
+                "<tt><body><p begin='1'><span begin='2' end='1'>backwards</span></p></body></tt>"
+            )
+            .is_none()
+        );
+        assert!(from_ttml("<broken>").is_none());
+        assert_eq!(ttml_time("NaN"), None);
+        assert_eq!(ttml_time("-1"), None);
+        assert_eq!(ttml_time("01:02:03.456"), Some(3_723_456));
+        let old: Line = serde_json::from_str(r#"{"at_ms":1000,"text":"old cache"}"#).unwrap();
+        assert!(old.words.is_empty());
+    }
+
+    #[tokio::test]
+    async fn word_provider_handles_auth_failure_and_returns_real_timings() {
+        let query = Query {
+            artist: "Artist".into(),
+            title: "Song".into(),
+            album: "Album".into(),
+            duration_ms: 120_000,
+        };
+        let (url, server) = lrclib(vec![
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ])
+        .await;
+        assert!(
+            better_words(&reqwest::Client::new(), &url, &query)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        server.await.unwrap();
+        let (url, server) = lrclib(vec![
+            r#"HTTP/1.1 200 OK
+Connection: close
+Content-Type: application/json
+
+{"ttml":"<tt><body><p begin='1'><span begin='1' end='2'>Hello</span></p></body></tt>"}"#,
+        ])
+        .await;
+        let lyrics = better_words(&reqwest::Client::new(), &url, &query)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lyrics.lines[0].words[0].end_ms, 2000);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "queries the public Better Lyrics cache; run manually"]
+    async fn word_provider_live_smoke() {
+        let query = Query {
+            artist: "The Weeknd".into(),
+            title: "Blinding Lights".into(),
+            album: "After Hours".into(),
+            duration_ms: 200_000,
+        };
+        let lyrics = better_words(
+            &reqwest::Client::new(),
+            "https://api.betterlyrics.org/getLyrics",
+            &query,
+        )
+        .await
+        .unwrap()
+        .expect("live cached TTML with word timing");
+        assert!(
+            lyrics
+                .lines
+                .iter()
+                .map(|line| line.words.len())
+                .sum::<usize>()
+                > 20
+        );
+        for line in lyrics.lines {
+            for word in line.words {
+                assert!(line.text.get(word.start_byte..word.end_byte).is_some());
+                assert!(word.end_ms > word.start_ms);
+            }
+        }
+    }
 
     /// A local LRCLIB that gives each request, in turn, one of `answers`.
     async fn lrclib(answers: Vec<&'static str>) -> (String, tokio::task::JoinHandle<()>) {

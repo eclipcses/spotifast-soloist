@@ -777,3 +777,18 @@ session's own authorization. Spotify refuses the change if the playlist
 changed since. The request is sent once, never retried, and has a 20-second
 deadline. A row that is no longer
 in the playlist removes nothing; the playlist reloads and shows the error.
+
+## Word-timed lyrics in this fork
+
+After checking a local file's lyrics, this fork asks [Better Lyrics](https://betterlyrics.org)
+for TTML using song title, artist, album and duration. It sends no Spotify token,
+Soloist key or account identity. Actual word timestamps drive the lyric sweep;
+lyrics without them retain the estimated line sweep. Auxiliary background vocals
+and translations are omitted from the main lyric line. Spotify and LRCLIB remain
+fallbacks when word timing is missing, malformed, blocked or unavailable.
+
+This request has a four-second total timeout and a four-MiB response limit.
+Successful word lyrics are cached separately for thirty days so old LRCLIB
+cache entries cannot hide them. An unavailable match is checked again after six
+hours; transient failures are not cached. No retries bypass authentication or
+rate limits. Coverage depends on the public service's cache.

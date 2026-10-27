@@ -6113,7 +6113,7 @@ dependencies = [
 
 [[package]]
 name = "spotifast"
-version = "0.14.4"
+version = "0.14.5"
 dependencies = [
  "aes 0.8.4",
  "anyhow",
@@ -6178,6 +6178,7 @@ dependencies = [
  "rfd",
  "ring",
  "rodio",
+ "roxmltree",
  "rustls",
  "rustls-webpki",
  "serde",

@@ -871,6 +871,7 @@ fn sample_lyrics() -> crate::lyrics::Lyrics {
         lines: lines
             .iter()
             .map(|(at_ms, text)| crate::lyrics::Line {
+                words: Vec::new(),
                 at_ms: Some(*at_ms),
                 text: (*text).to_string(),
             })

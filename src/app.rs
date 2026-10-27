@@ -14120,6 +14120,7 @@ mod tests {
             app.lyrics = Loadable::Loaded(Some(crate::lyrics::Lyrics {
                 lines: (0..80)
                     .map(|i| crate::lyrics::Line {
+                        words: Vec::new(),
                         at_ms: Some(i * 5000),
                         text: format!("Autoscroll lyric line {i}"),
                     })
