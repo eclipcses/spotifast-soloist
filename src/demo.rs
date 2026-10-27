@@ -7978,7 +7978,7 @@ mod tests {
     }
 
     #[test]
-    fn fullscreen_lyrics_highlight_preserves_line_layout() {
+    fn fullscreen_lyrics_focus_preserves_wrapping_and_neighbor_positions() {
         let root =
             std::env::temp_dir().join(format!("spotifast-lyrics-layout-{}", std::process::id()));
         let ctx = egui::Context::default();
@@ -8030,20 +8030,38 @@ mod tests {
                                 && text.galley.job.text
                                     == "Streetlights blinking down the river road"
                             {
-                                Some(text.galley.size())
+                                Some((text.galley.size(), text.galley.rows.len()))
                             } else {
                                 None
                             }
                         })
                         .expect("the lyric line is rendered");
-                    sizes.push(line);
+                    let next_y = output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| {
+                            if let egui::Shape::Text(text) = &shape.shape
+                                && text.galley.job.text == "Every window holding someone's evening"
+                            {
+                                Some(text.pos.y)
+                            } else {
+                                None
+                            }
+                        })
+                        .expect("the neighboring line is rendered");
+                    sizes.push((line.0, line.1, next_y));
                 }
             }
         }
         app.backend.shutdown();
-        assert_eq!(
-            sizes[0], sizes[1],
-            "highlighting must not rewrap or resize a line"
+        assert_eq!(sizes[0].1, sizes[1].1, "focus must not rewrap a line");
+        assert!(
+            (sizes[0].2 - sizes[1].2).abs() < 0.1,
+            "focus must not move neighboring lines"
+        );
+        assert!(
+            sizes[1].0.x >= sizes[0].0.x && sizes[1].0.x <= sizes[0].0.x * 1.08,
+            "the painted focus scale stays subtle"
         );
     }
 

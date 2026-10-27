@@ -772,14 +772,13 @@ fn art_buckets(bytes: &[u8]) -> Option<Vec<(u64, [u8; 3])>> {
     (!buckets.is_empty()).then_some(buckets)
 }
 
-/// Blur applied to the full-window lyrics backdrop.
-const LYRICS_BLUR: f32 = 9.0;
+/// A cached ambient field stays small even on a high-resolution display.
+const LYRICS_AMBIENT_SIDE: usize = 128;
 
 /// Blur applied to a library thumbnail standing in for a cover.
 ///
-/// Softening happens at the same bounded size as the backdrop, so this is
-/// weaker than the backdrop's radius: the thumbnail already carries little
-/// detail, and a heavier blur smears it into flat colour.
+/// A bounded thumbnail already carries little detail, so only a gentle
+/// blur is needed to stand in for the full cover while it loads.
 const COVER_BLUR: f32 = 1.5;
 
 /// Softened covers held at once, for library artwork seen recently.
@@ -798,7 +797,7 @@ pub struct LyricsBackdrop {
 const BACKDROP_RETRY: Duration = Duration::from_secs(3);
 
 impl LyricsBackdrop {
-    /// The blurred backdrop for `uri`.
+    /// The ambient album-color backdrop for `uri`.
     ///
     /// The artwork is fetched here, from the disk cache or the network,
     /// rather than read from the bytes the image loader holds: a cover
@@ -833,7 +832,7 @@ impl LyricsBackdrop {
                 let result = match inner.fetch(&url).await {
                     Ok(bytes) => inner
                         .runtime
-                        .spawn_blocking(move || blurred_background(&bytes, LYRICS_BLUR))
+                        .spawn_blocking(move || ambient_background(&bytes))
                         .await
                         .map_err(|error| error.to_string()),
                     Err(error) => Err(error),
@@ -990,6 +989,75 @@ impl SoftenedCovers {
         });
         None
     }
+}
+
+/// Turn artwork into broad, overlapping color washes rather than enlarging
+/// the cover itself. Four softly sampled regions retain the album's palette
+/// while losing lettering and recognizable objects. This runs once on the
+/// artwork worker; drawing the lyrics only samples its cached 128px texture.
+fn ambient_background(bytes: &[u8]) -> Option<egui::ColorImage> {
+    let small = decode(bytes).ok()?.thumbnail(32, 32).to_rgb8();
+    let (width, height) = small.dimensions();
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let regions = [[0.18, 0.22], [0.82, 0.24], [0.22, 0.82], [0.78, 0.78]];
+    let colors: Vec<[f32; 3]> = regions
+        .iter()
+        .map(|center| {
+            let mut total = 0.0;
+            let mut sum = [0.0; 3];
+            for (x, y, pixel) in small.enumerate_pixels() {
+                let uv = [
+                    (x as f32 + 0.5) / width as f32,
+                    (y as f32 + 0.5) / height as f32,
+                ];
+                let dx = uv[0] - center[0];
+                let dy = uv[1] - center[1];
+                let rgb = pixel.0.map(|channel| f32::from(channel) / 255.0);
+                let max = rgb[0].max(rgb[1]).max(rgb[2]);
+                let min = rgb[0].min(rgb[1]).min(rgb[2]);
+                // Album colors outweigh a black frame or small white lettering.
+                let vivid = 1.0 + (max - min) * 2.0;
+                let weight = (-(dx * dx + dy * dy) * 7.0).exp() * vivid;
+                total += weight;
+                for channel in 0..3 {
+                    sum[channel] += rgb[channel] * weight;
+                }
+            }
+            let rgb = sum.map(|channel| channel / total);
+            let luma = rgb[0] * 0.2126 + rgb[1] * 0.7152 + rgb[2] * 0.0722;
+            rgb.map(|channel| (luma + (channel - luma) * 1.22).clamp(0.0, 1.0))
+        })
+        .collect();
+    // Offset the washes from the sampled regions, so the composition of the
+    // cover cannot become a second, oversized album image behind the words.
+    let centers = [[-0.12, 0.12], [0.98, -0.12], [0.08, 1.10], [1.12, 0.88]];
+    let mut pixels = Vec::with_capacity(LYRICS_AMBIENT_SIDE * LYRICS_AMBIENT_SIDE);
+    for y in 0..LYRICS_AMBIENT_SIDE {
+        for x in 0..LYRICS_AMBIENT_SIDE {
+            let uv = [
+                x as f32 / (LYRICS_AMBIENT_SIDE - 1) as f32,
+                y as f32 / (LYRICS_AMBIENT_SIDE - 1) as f32,
+            ];
+            let mut total = 0.0;
+            let mut sum = [0.0; 3];
+            for (center, color) in centers.iter().zip(&colors) {
+                let dx = uv[0] - center[0];
+                let dy = uv[1] - center[1];
+                let weight = (-(dx * dx * 3.8 + dy * dy * 2.6)).exp() + 0.03;
+                total += weight;
+                for channel in 0..3 {
+                    sum[channel] += color[channel] * weight;
+                }
+            }
+            let rgb = sum.map(|channel| {
+                ((channel / total * 0.9 + 0.035).clamp(0.0, 1.0) * 255.0).round() as u8
+            });
+            pixels.push(egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+        }
+    }
+    Some(egui::ColorImage::new([LYRICS_AMBIENT_SIDE; 2], pixels))
 }
 
 fn blurred_background(bytes: &[u8], sigma: f32) -> Option<egui::ColorImage> {
@@ -1590,7 +1658,8 @@ mod tests {
         let image = image::RgbImage::from_pixel(8193, 1, image::Rgb([20, 30, 40]));
         let mut bytes = std::io::Cursor::new(Vec::new());
         image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
-        assert!(blurred_background(bytes.get_ref(), LYRICS_BLUR).is_none());
+        assert!(blurred_background(bytes.get_ref(), 9.0).is_none());
+        assert!(ambient_background(bytes.get_ref()).is_none());
     }
 
     fn softened_test_image() -> egui::ColorImage {
@@ -1758,6 +1827,44 @@ mod tests {
     }
 
     #[test]
+    fn lyrics_ambient_field_keeps_album_hues_but_loses_fine_artwork() {
+        let split = image::RgbImage::from_fn(320, 160, |x, _| {
+            if x < 160 {
+                image::Rgb([235, 24, 35])
+            } else {
+                image::Rgb([24, 45, 235])
+            }
+        });
+        let field = ambient_background(&cover_png(&split)).unwrap();
+        assert_eq!(field.size, [128, 128]);
+        let left = field.pixels[64 * 128];
+        let right = field.pixels[64 * 128 + 127];
+        assert!(
+            left.r() > left.b(),
+            "the red side retains its hue: {left:?}"
+        );
+        assert!(
+            right.b() > right.r(),
+            "the blue side retains its hue: {right:?}"
+        );
+
+        let checks = image::RgbImage::from_fn(256, 256, |x, y| {
+            if (x + y) % 2 == 0 {
+                image::Rgb([240, 25, 40])
+            } else {
+                image::Rgb([20, 40, 240])
+            }
+        });
+        let field = ambient_background(&cover_png(&checks)).unwrap();
+        let reds: Vec<_> = field.pixels.iter().map(|pixel| pixel.r()).collect();
+        assert!(
+            reds.iter().max().unwrap() - reds.iter().min().unwrap() < 5,
+            "fine checkerboard detail must disappear instead of becoming a second cover"
+        );
+        assert!(ambient_background(b"broken artwork").is_none());
+    }
+
+    #[test]
     fn blurred_background_blurs_edges_and_bounds_texture_size() {
         let image = image::RgbImage::from_fn(640, 320, |x, _| {
             if x < 320 {
@@ -1768,7 +1875,7 @@ mod tests {
         });
         let mut bytes = std::io::Cursor::new(Vec::new());
         image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
-        let background = blurred_background(bytes.get_ref(), LYRICS_BLUR).expect("valid artwork");
+        let background = blurred_background(bytes.get_ref(), 9.0).expect("valid artwork");
         assert_eq!(background.size, [256, 128]);
         let center = background.pixels[64 * 256 + 128];
         assert!(
@@ -1779,7 +1886,7 @@ mod tests {
             background.pixels[0].r() > 240,
             "the cover's colors remain recognizable"
         );
-        assert!(blurred_background(b"broken artwork", LYRICS_BLUR).is_none());
+        assert!(blurred_background(b"broken artwork", 9.0).is_none());
     }
 
     /// The media controls ask for a file rather than a URL, and have to be

@@ -10,7 +10,7 @@ use crate::theme::{self, Icon};
 use super::widgets;
 
 const LINE_SIZE: f32 = 24.0;
-const LINE_GAP: f32 = 16.0;
+const LINE_GAP: f32 = 20.0;
 /// Where the line being sung sits, as a fraction of the visible lyrics from
 /// the top: high up, so the lines to come fill most of the view.
 const SUNG_LINE_AT: f32 = 0.2;
@@ -68,39 +68,82 @@ fn line_progress(lyrics: &crate::lyrics::Lyrics, index: usize, position: u32) ->
     ))
 }
 
-/// Paint the same shaped text twice, clipping the bright layer row by row.
-/// Layout never changes during the sweep, including wrapped and RTL text.
-fn lyric_label(
-    ui: &mut egui::Ui,
-    text: &str,
+struct LyricStyle {
     size: f32,
     color: Color32,
-    sense: Sense,
     sweep: Option<Sweep>,
-) -> egui::Response {
+    focus: f32,
+}
+
+/// Allocate at the largest size, then scale only the painted text. Word
+/// highlighting, wrapping and seek targets stay fixed as focus changes.
+fn lyric_label(ui: &mut egui::Ui, text: &str, sense: Sense, style: LyricStyle) -> egui::Response {
     let galley = crate::bidi::layout(
         ui.painter(),
         text,
-        theme::bold(size),
-        color,
+        theme::bold(style.size),
+        style.color,
         ui.available_width(),
         usize::MAX,
         None,
     );
-    let response = ui.add(egui::Label::new(galley.clone()).sense(sense));
-    if let Some(progress) = sweep {
-        let origin = crate::bidi::galley_pos(response.rect, &galley);
+    // Selection-enabled skins keep egui's own selection painting, then
+    // receive the same word highlight without a focus transform.
+    let selectable = ui.style().interaction.selectable_labels;
+    let (origin, galley, response) = if selectable {
+        let response = ui.add(egui::Label::new(galley.clone()).sense(sense));
+        (
+            crate::bidi::galley_pos(response.rect, &galley),
+            galley,
+            response,
+        )
+    } else {
+        egui::Label::new(galley).sense(sense).layout_in_ui(ui)
+    };
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), text));
+    if !ui.is_rect_visible(response.rect) {
+        return response;
+    }
+    let reduced = crate::motion::reduced(ui.ctx()) || selectable;
+    let focus = if reduced { 1.0 } else { style.focus };
+    let scale = 0.94 + 0.06 * focus;
+    let anchor = if crate::bidi::is_rtl(text) {
+        response.rect.right_center()
+    } else {
+        response.rect.left_center()
+    };
+    let transform = egui::emath::TSTransform {
+        scaling: scale,
+        translation: anchor.to_vec2() * (1.0 - scale)
+            + vec2(0.0, if reduced { 0.0 } else { -1.5 * focus }),
+    };
+    let color = if response.hovered() {
+        blend(style.color, ui.visuals().text_color(), 0.25)
+    } else {
+        style.color
+    };
+    let mut shape =
+        egui::epaint::TextShape::new(origin, galley.clone(), color).with_override_text_color(color);
+    if response.has_focus() || response.highlighted() {
+        shape = shape.with_underline(egui::Stroke::new(1.0, ui.visuals().text_color()));
+    }
+    shape.transform(transform);
+    if !selectable {
+        ui.painter().add(shape.clone());
+    }
+    if let Some(progress) = style.sweep {
         let total: f32 = galley.rows.iter().map(|row| row.rect().width()).sum();
         let mut remaining = match progress {
             Sweep::Estimated(ratio) => total * ratio,
             Sweep::TimedBytes(_) => 0.0,
         };
         for row in &galley.rows {
-            let mut clip = row.rect().translate(origin.to_vec2());
+            let bounds = row.rect().translate(origin.to_vec2());
             let width = match progress {
                 Sweep::Estimated(_) => {
-                    let width = remaining.clamp(0.0, clip.width());
-                    remaining -= clip.width();
+                    let width = remaining.clamp(0.0, bounds.width());
+                    remaining -= bounds.width();
                     width
                 }
                 Sweep::TimedBytes(boundary) => {
@@ -118,7 +161,7 @@ fn lyric_label(
                         bright += glyph.advance_width * amount;
                     }
                     if whole > 0.0 {
-                        clip.width() * bright / whole
+                        bounds.width() * bright / whole
                     } else {
                         0.0
                     }
@@ -127,14 +170,41 @@ fn lyric_label(
             if width <= 0.0 {
                 continue;
             }
-            if crate::bidi::is_rtl(text) {
-                clip.min.x = clip.max.x - width;
+            let rtl = crate::bidi::is_rtl(text);
+            let feather = if width >= bounds.width() {
+                0.0
             } else {
-                clip.max.x = clip.min.x + width;
+                (style.size * 0.22).min(width)
+            };
+            let core = width - feather;
+            let paint = |from: f32, to: f32, alpha: f32| {
+                if to <= from {
+                    return;
+                }
+                let mut clip = bounds;
+                if rtl {
+                    clip.min.x = bounds.right() - to;
+                    clip.max.x = bounds.right() - from;
+                } else {
+                    clip.min.x = bounds.left() + from;
+                    clip.max.x = bounds.left() + to;
+                }
+                let clip = transform.mul_rect(clip).intersect(ui.clip_rect());
+                ui.painter().with_clip_rect(clip).add(
+                    shape
+                        .clone()
+                        .with_override_text_color(ui.visuals().text_color().gamma_multiply(alpha)),
+                );
+            };
+            paint(0.0, core, 1.0);
+            // Four tiny strips soften the advancing edge, only on the sung row.
+            for step in 0..4 {
+                paint(
+                    core + feather * step as f32 / 4.0,
+                    core + feather * (step + 1) as f32 / 4.0,
+                    1.0 - (step as f32 + 0.5) / 4.0,
+                );
             }
-            ui.painter()
-                .with_clip_rect(ui.clip_rect().intersect(clip))
-                .galley_with_override_text_color(origin, galley.clone(), ui.visuals().text_color());
         }
     }
     response
@@ -359,7 +429,7 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                     blend(
                         quiet,
                         palette.text,
-                        lit * if sweep.is_some() { 0.35 } else { 1.0 },
+                        lit * if sweep.is_some() { 0.24 } else { 1.0 },
                     )
                 } else {
                     palette.text
@@ -375,7 +445,17 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                 } else {
                     Sense::hover()
                 };
-                let response = lyric_label(ui, text, LINE_SIZE, color, sense, sweep);
+                let response = lyric_label(
+                    ui,
+                    text,
+                    sense,
+                    LyricStyle {
+                        size: LINE_SIZE,
+                        color,
+                        sweep,
+                        focus: if lyrics.synced { lit } else { 1.0 },
+                    },
+                );
                 crate::autoscroll::row(ui, &response);
                 let rect = response.rect;
                 if lyrics.synced
@@ -516,9 +596,9 @@ fn with_cover(app: &mut App, ui: &mut egui::Ui, rect: Rect, top: f32) {
             fullscreen_contents(app, &mut content);
         } else {
             // The cover and the lyrics are one group, centred in the window.
-            let side = (below.width() * 0.38)
+            let side = (below.width() * 0.34)
                 .min(below.height() - 90.0)
-                .clamp(200.0, 520.0);
+                .clamp(200.0, 440.0);
             let lyrics_width = (below.width() - side - gap).min(LYRICS_BESIDE_WIDTH);
             let left = below.center().x - (side + gap + lyrics_width) / 2.0;
             let column = Rect::from_min_size(
@@ -612,7 +692,7 @@ fn big_cover(app: &App, ui: &mut egui::Ui, column: Rect, align: Align) {
     };
     let side = column.width();
     let cover = Rect::from_min_size(column.min, vec2(side, side));
-    let radius = 10.0;
+    let radius = 16.0;
     ui.painter().add(
         egui::epaint::Shadow {
             offset: [0, 18],
@@ -679,10 +759,10 @@ fn background(app: &mut App, ui: &mut egui::Ui, rect: Rect) {
             texture.id(),
             rect,
             cover_uv(rect.size(), texture.size_vec2()),
-            Color32::from_gray(180),
+            Color32::from_gray(245),
         );
     }
-    painter.rect_filled(rect, 0.0, Color32::from_black_alpha(120));
+    painter.rect_filled(rect, 0.0, Color32::from_black_alpha(75));
     widgets::paint_vertical_gradient(
         ui,
         rect,
@@ -707,8 +787,8 @@ fn fullscreen_header(app: &mut App, ui: &mut egui::Ui) {
         theme::text(
             ui,
             gettext(app.locale, "Lyrics"),
-            theme::bold(18.0),
-            palette.text,
+            theme::regular(13.0),
+            palette.secondary,
         );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if theme::icon_button(
@@ -864,12 +944,14 @@ fn fullscreen_contents(app: &mut App, ui: &mut egui::Ui) {
         });
     let following = app.lyrics_following && !manual_scroll;
     let follow = following && app.lyrics_line_shown != Some(active);
-    let animation = crate::motion::scroll(ui.ctx(), 0.45);
+    let animation = crate::motion::scroll(ui.ctx(), 0.6);
     let size = (ui.available_width() * 0.065).clamp(30.0, 46.0);
     // The line being sung brightens; all lines keep the same font metrics
     // so highlighting cannot rewrap the words during a transition.
     // A line takes 300 ms to light up or fade.
-    let quiet = palette.text.gamma_multiply(0.38);
+    let quiet = palette
+        .text
+        .gamma_multiply(if following { 0.30 } else { 0.62 });
     ui.spacing_mut().scroll.fade.strength = 0.0;
     egui::ScrollArea::vertical()
         .id_salt(("fullscreen-lyrics-scroll", &now.uri))
@@ -910,7 +992,7 @@ fn fullscreen_contents(app: &mut App, ui: &mut egui::Ui) {
                     blend(
                         quiet,
                         palette.text,
-                        lit * if sweep.is_some() { 0.35 } else { 1.0 },
+                        lit * if sweep.is_some() { 0.24 } else { 1.0 },
                     )
                 } else {
                     palette.text
@@ -933,7 +1015,17 @@ fn fullscreen_contents(app: &mut App, ui: &mut egui::Ui) {
                 let response = ui
                     .scope(|ui| {
                         ui.multiply_opacity(edge * edge * (3.0 - 2.0 * edge));
-                        lyric_label(ui, text, size, color, sense, sweep)
+                        lyric_label(
+                            ui,
+                            text,
+                            sense,
+                            LyricStyle {
+                                size,
+                                color,
+                                sweep,
+                                focus: if lyrics.synced { lit } else { 1.0 },
+                            },
+                        )
                     })
                     .inner;
                 let rect = response.rect;
@@ -947,7 +1039,7 @@ fn fullscreen_contents(app: &mut App, ui: &mut egui::Ui) {
                 if is_active && follow {
                     show_sung_line(ui, rect, Some(animation));
                 }
-                ui.add_space(27.0);
+                ui.add_space(36.0);
             }
             // Words without timing can only be followed by the clock: sit
             // at the part of the text the song is probably at.
@@ -990,6 +1082,37 @@ fn fullscreen_contents(app: &mut App, ui: &mut egui::Ui) {
 #[cfg(test)]
 mod tests {
     use super::{Sweep, fullscreen_content_width, line_progress, preferred_backdrop_art};
+
+    #[test]
+    fn selectable_lyrics_keep_the_word_highlight_overlay() {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.style_mut().interaction.selectable_labels = true;
+            super::lyric_label(
+                ui,
+                "A timed lyric",
+                egui::Sense::click(),
+                super::LyricStyle {
+                    size: 24.0,
+                    color: egui::Color32::GRAY,
+                    sweep: Some(Sweep::Estimated(0.5)),
+                    focus: 1.0,
+                },
+            );
+        });
+        output.textures_delta.clear();
+        assert!(
+            output
+                .shapes
+                .iter()
+                .filter(|shape| matches!(&shape.shape,
+            egui::Shape::Text(text) if text.galley.job.text == "A timed lyric"))
+                .count()
+                > 1,
+            "selection must retain both base text and karaoke highlight"
+        );
+    }
 
     #[test]
     fn real_timing_holds_between_words_and_follows_seeks_on_final_line() {
